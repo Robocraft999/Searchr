@@ -1,10 +1,9 @@
 mod engine;
 mod index;
 
-use std::path::PathBuf;
-use clap::{Parser, Subcommand};
 use crate::engine::Engine;
 use crate::index::{Index, LocalFilesystemSource};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "searchr")]
@@ -27,6 +26,8 @@ enum Commands {
 fn main() {
     let mut index = Index::new();
     index.add(Box::from(LocalFilesystemSource::new("./test")));
+    index.add(Box::from(LocalFilesystemSource::new("./test/sub")));
+    index.add(Box::from(LocalFilesystemSource::new("C:/Users/Admin/.rustup/toolchains/stable-x86_64-pc-windows-msvc/share/doc/rust/html/std/collections")));
     let mut engine = Engine::new(index);
 
     let args = Cli::parse();
@@ -35,7 +36,7 @@ fn main() {
             engine.index();
         }
         Commands::Search {query} => {
-            println!("Searching for {}", query);
+            engine.search(query);
         }
     }
     println!("Finished");
