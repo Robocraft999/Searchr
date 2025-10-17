@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::fs;
+use std::{fs, mem};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, PrepFlags, TransactionBehavior};
 
 pub trait IndexSource{
     //TODO query type and type for results
@@ -34,8 +34,10 @@ impl Index{
 
     pub fn build_index(&mut self){
         if let Some(conn) = &mut self.connection {
-            let mut inverted_index: HashMap<String, Vec<String>> = HashMap::new();
+            let mut inverted_index: HashMap<String, usize> = HashMap::new();
             let mut documents = Vec::new();
+
+            conn.pragma_update(None, "journal_mode", &"OFF").unwrap();
 
             conn.execute_batch("
                 DROP TABLE IF EXISTS doc_terms;
@@ -60,38 +62,50 @@ impl Index{
             "
             ).expect("Database setup failed");
 
+            let transaction = conn.transaction_with_behavior(TransactionBehavior::Exclusive).unwrap();
+            let mut document_stmt = transaction.prepare_with_flags("INSERT INTO documents VALUES (?1, ?2)", PrepFlags::SQLITE_PREPARE_PERSISTENT).unwrap();
+            let mut term_stmt = transaction.prepare_with_flags("INSERT OR REPLACE INTO terms VALUES (?1, ?2)", PrepFlags::SQLITE_PREPARE_PERSISTENT).unwrap();
+            let mut doc_term_stmt = transaction.prepare_with_flags("INSERT INTO doc_terms VALUES (?1, ?2, ?3)", PrepFlags::SQLITE_PREPARE_PERSISTENT).unwrap();
+
+
             for source in self.sources.iter() {
                 let source_documents = source.resolve();
                 for document in source_documents {
+                    println!("{}", document.name);
                     documents.push(document.name.clone());
-                    conn.execute("INSERT INTO documents VALUES (?1, ?2)", (document.name.as_str(), "")).unwrap();
+                    document_stmt.execute((document.name.as_str(), "")).unwrap();
 
-                    let mut words2 = HashMap::new();
+                    let mut unique_term_counts = HashMap::new();
                     for word in document.terms.iter() {
-                        if !words2.contains_key(word) {
-                            words2.insert(word.clone(), document.terms.iter().filter(|&w| w == word).count());
+                        if !unique_term_counts.contains_key(word) {
+                            unique_term_counts.insert(word.clone(), 0);
                         }
+                        *unique_term_counts.get_mut(&word.clone()).unwrap() += 1;
                     }
 
-                    for (word, count) in words2 {
+                    for (word, count) in unique_term_counts {
                         let tf = count as f64 / document.terms.len() as f64;
 
                         if !inverted_index.contains_key(&word) {
-                            inverted_index.insert(word.clone(), Vec::new());
-                            conn.execute("INSERT INTO terms VALUES (?1, ?2)", (word.as_str(), 0)).unwrap();
+                            inverted_index.insert(word.clone(), 0);
+                            term_stmt.execute((word.as_str(), 0)).unwrap();
                         }
-                        inverted_index.get_mut(&word).unwrap().push(document.name.clone());
+                        *inverted_index.get_mut(&word).unwrap() += 1;
 
-                        conn.execute("INSERT INTO doc_terms VALUES (?1, ?2, ?3)", (document.name.as_str(), word.as_str(), tf)).unwrap();
+                        doc_term_stmt.execute((document.name.as_str(), word.as_str(), tf)).unwrap();
                     }
                 }
             }
 
-            for (word, docs) in inverted_index{
-                let idf = (documents.len() as f64 / docs.len() as f64).log10();
+            for (term, doc_count) in inverted_index{
+                let idf = (documents.len() as f64 / doc_count as f64).log10();
 
-                conn.execute("INSERT OR REPLACE INTO terms VALUES (?1, ?2)", (word.as_str(), idf)).unwrap();
+                term_stmt.execute((term.as_str(), idf)).unwrap();
             }
+            document_stmt.finalize().unwrap();
+            term_stmt.finalize().unwrap();
+            doc_term_stmt.finalize().unwrap();
+            transaction.commit().unwrap();
         }
     }
 
@@ -135,10 +149,17 @@ impl IndexSource for LocalFilesystemSource {
     fn resolve(&self) -> Vec<Document> {
         let mut contents = Vec::new();
         for path in fs::read_dir(&self.path).unwrap().filter_map(|entry| entry.ok()).filter_map(|entry| if entry.path().is_file() {Some(entry.path())} else {None}){
-            println!("{path:?}");
             let mut lines = String::new();
             let mut file = File::open(path.clone()).unwrap();
-            let _ = file.read_to_string(&mut lines);
+            match path.extension().unwrap().to_str().unwrap() {
+                "html" => {
+                    lines = html2text::config::plain().string_from_read(file, 50).unwrap();
+                }
+                _ => {
+                    let _ = file.read_to_string(&mut lines);
+                }
+            }
+
             //TODO do proper term splitting
             let terms = lines.split_whitespace().map(|w| w.to_owned()).collect::<Vec<String>>();
             contents.push(Document{
